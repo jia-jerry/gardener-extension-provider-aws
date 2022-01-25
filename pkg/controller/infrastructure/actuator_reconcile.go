@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 
@@ -29,8 +30,12 @@ import (
 	extensionscontroller "github.com/gardener/gardener/extensions/pkg/controller"
 	"github.com/gardener/gardener/extensions/pkg/terraformer"
 	corehelper "github.com/gardener/gardener/pkg/apis/core/helper"
+	v1beta1constants "github.com/gardener/gardener/pkg/apis/core/v1beta1/constants"
 	extensionsv1alpha1 "github.com/gardener/gardener/pkg/apis/extensions/v1alpha1"
+	"github.com/gardener/gardener/pkg/client/kubernetes"
 	"github.com/go-logr/logr"
+	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/util/retry"
@@ -68,7 +73,11 @@ func (a *actuator) reconcile(
 		return nil, nil, fmt.Errorf("failed to create new AWS client: %+v", err)
 	}
 
-	terraformConfig, err := generateTerraformInfraConfig(ctx, infrastructure, infrastructureConfig, awsClient, cluster)
+	kubeAPIServerCIDRs, err := getShootKubeAPIServerCIDRs(ctx, logger, infrastructure, a.Client())
+	if err != nil {
+		return nil, nil, err
+	}
+	terraformConfig, err := generateTerraformInfraConfig(ctx, infrastructure, infrastructureConfig, awsClient, cluster, kubeAPIServerCIDRs)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to generate Terraform config: %+v", err)
 	}
@@ -102,11 +111,58 @@ func (a *actuator) reconcile(
 	return computeProviderStatus(ctx, tf, infrastructureConfig)
 }
 
+func getShootKubeAPIServerCIDRs(
+	ctx context.Context,
+	logger logr.Logger,
+	infrastructure *extensionsv1alpha1.Infrastructure,
+	seedClient client.Client,
+) ([]string, error) {
+	var kubeAPIServerCIDRs []string
+
+	secretName := v1beta1constants.SecretNameGardener
+	// If the gardenlet runs in the same cluster like the API server of the shoot then use the internal kubeconfig
+	// and communicate internally. Otherwise, fall back to the "external" kubeconfig and communicate via the
+	// load balancer of the shoot API server.
+	addr, err := net.LookupHost(fmt.Sprintf("%s.%s.svc", v1beta1constants.DeploymentNameKubeAPIServer, infrastructure.Namespace))
+	if err != nil {
+		logger.Info("service DNS name lookup of kube-apiserver failed, falling back to external kubeconfig", "error", err)
+	} else if len(addr) > 0 {
+		secretName = v1beta1constants.SecretNameGardenerInternal
+	}
+
+	clientSet, err := kubernetes.NewClientFromSecret(ctx, seedClient, infrastructure.Namespace, secretName)
+
+	if secretName == v1beta1constants.SecretNameGardenerInternal && err != nil && apierrors.IsNotFound(err) {
+		clientSet, err = kubernetes.NewClientFromSecret(ctx, seedClient, infrastructure.Namespace, v1beta1constants.SecretNameGardener)
+	}
+
+	if clientSet == nil {
+		return nil, fmt.Errorf("error getting shoot clientset from secret")
+	}
+
+	var kubernetesEndpoint v1.Endpoints
+	err = clientSet.Client().Get(ctx, client.ObjectKey{
+		Name: "kubernetes",
+	}, &kubernetesEndpoint)
+	if err != nil {
+		return nil, fmt.Errorf("failed getting kubernetes endpoint from shoot %+v", err)
+	}
+
+	for _, subset := range kubernetesEndpoint.Subsets {
+		for _, address := range subset.Addresses {
+			kubeAPIServerCIDRs = append(kubeAPIServerCIDRs, address.IP+"/32")
+		}
+	}
+
+	return kubeAPIServerCIDRs, nil
+}
+
 func generateTerraformInfraConfig(ctx context.Context,
 	infrastructure *extensionsv1alpha1.Infrastructure,
 	infrastructureConfig *awsapi.InfrastructureConfig,
 	awsClient awsclient.Interface,
 	cluster *extensionscontroller.Cluster,
+	kubeAPIServerCIDRs []string,
 ) (map[string]interface{}, error) {
 	var (
 		dhcpDomainName    = "ec2.internal"
@@ -184,8 +240,9 @@ func generateTerraformInfraConfig(ctx context.Context,
 			"internetGatewayID": internetGatewayID,
 			"gatewayEndpoints":  infrastructureConfig.Networks.VPC.GatewayEndpoints,
 		},
-		"clusterName": infrastructure.Namespace,
-		"zones":       zones,
+		"clusterName":        infrastructure.Namespace,
+		"zones":              zones,
+		"kubeAPIServerCIDRs": kubeAPIServerCIDRs,
 		"ignoreTags": map[string]interface{}{
 			"keys":        ignoreTagKeys,
 			"keyPrefixes": ignoreTagKeyPrefixes,
