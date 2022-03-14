@@ -16,9 +16,11 @@ package helper
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/gardener/gardener/pkg/apis/core"
 	gardencorev1beta1 "github.com/gardener/gardener/pkg/apis/core/v1beta1"
+	v1beta1consts "github.com/gardener/gardener/pkg/apis/core/v1beta1/constants"
 
 	"github.com/Masterminds/semver"
 	corev1 "k8s.io/api/core/v1"
@@ -391,4 +393,18 @@ func CalculateSeedUsage(shootList []*core.Shoot) map[string]int {
 	}
 
 	return m
+}
+
+// AutomaticCordonZones determines whether to automatically cordon zones
+func AutomaticCordonZones(provider *core.Provider) bool {
+	return provider.AutoCordonZones != nil && *provider.AutoCordonZones
+}
+
+func GetCorndonedZones(shootAnnotaions map[string]string) []string {
+	cordonedZonesStr, ok := shootAnnotaions[v1beta1consts.CordonedZones]
+	if !ok {
+		return []string{}
+	}
+
+	return strings.Split(cordonedZonesStr, ",")
 }
